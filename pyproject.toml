@@ -10,6 +10,10 @@ dependencies = [
     "pydantic-settings>=2.10",
     "typer>=0.16",
     "rich>=14.0",
+    "rapidocr>=3.10.0",
+    "onnxruntime>=1.32.0",
+    "faster-whisper>=1.2.1",
+    "rapidfuzz>=3.14.6",
 ]
 
 # Baad ke phases mein add honge:
@@ -33,7 +37,8 @@ target-version = "py314"
 
 [tool.ruff.lint]
 # B008: typer.Option() defaults ka idiom hai; PLW1510: returncode khud check karte hain
-ignore = ["B008", "PLW1510"]
+# SIM102: walrus + nested if zyada readable; S110: optional GPU check ka silent fallback
+ignore = ["B008", "PLW1510", "SIM102", "S110"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

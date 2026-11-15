@@ -1,9 +1,11 @@
-"""Command-line tool (Phase 1). Chalayen:  uv run python -m pipeline.cli --help"""
+"""Command-line tool. Chalayen:  uv run python -m pipeline.cli --help"""
 
 from __future__ import annotations
 
 import json
+import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -14,12 +16,21 @@ from rich.table import Table
 
 from app.config import settings
 from pipeline.cutter import cut_segments
+from pipeline.finder import evaluate, find_segments
 from pipeline.frames import Crop, iter_frames
 from pipeline.media import probe
+from pipeline.players import Player
 from pipeline.scenes import detect_shots
 from pipeline.segments import MergeOptions, Segment, format_time, merge_segments, snap_to_shots
+from pipeline.signals.commentary import find_mentions, transcribe, words_from_transcript
+from pipeline.signals.scoreboard import parse_scan, scan_graphics
 
 app = typer.Typer(help="VideoExtractor pipeline tools", no_args_is_help=True)
+
+# Windows console (cp1252) Urdu/Hindi/arrows print nahi kar sakta
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
 console = Console()
 
 
@@ -99,6 +110,122 @@ def cut(
     for seg, p in zip(merged, paths, strict=True):
         console.print(f"  {format_time(seg.start)} → {format_time(seg.end)}  {p.name}")
     console.print(f"[green]{len(paths)} clips[/] → {out}")
+
+
+def _progress_task(label: str):
+    """Rich progress bar context + 0–1 callback."""
+    progress = Progress(console=console)
+    task = progress.add_task(label, total=1.0)
+    return progress, lambda f: progress.update(task, completed=f)
+
+
+@app.command()
+def graphics(video: Path, no_cache: bool = False) -> None:
+    """Scoreboard / cards OCR — kaun kaun se naam aaye (batsmen, bowlers, cards)."""
+    progress, cb = _progress_task("Scoreboard OCR")
+    with progress:
+        scan = scan_graphics(video, use_cache=not no_cache, on_progress=cb)
+    st = scan["stats"]
+    console.print(f"[green]{st['frames']} frames[/], OCR {st['ocr_runs']} dafa, {st['elapsed']}s")
+    frames = parse_scan(scan)
+    bats = Counter(b for g in frames for b in g.batsmen)
+    bowl = Counter(g.bowler for g in frames if g.bowler)
+    events = Counter(g.event for g in frames if g.event)
+    with_sb = sum(g.has_scoreboard for g in frames)
+    console.print(f"Scoreboard dikha: {with_sb}/{len(frames)} frames")
+    console.print("[bold]Batsmen:[/]", ", ".join(f"{k} ({v})" for k, v in bats.most_common(25)))
+    console.print("[bold]Bowlers:[/]", ", ".join(f"{k} ({v})" for k, v in bowl.most_common(15)))
+    console.print("[bold]Events:[/]", ", ".join(f"{k} ({v})" for k, v in events.most_common()))
+
+
+@app.command(name="transcribe")
+def transcribe_cmd(
+    video: Path,
+    model: str = typer.Option("small", help="tiny / base / small / medium / large-v3"),
+    player: Path = typer.Option(None, help="Player folder — naam Whisper ko hint ke taur par"),
+    language: str = typer.Option(None, help="en / ur / hi (khali = auto-detect)"),
+    fast: bool = typer.Option(False, help="~1.5x tez (beam 1), kuch naam chhoot sakte hain"),
+    no_cache: bool = False,
+) -> None:
+    """Commentary → text (faster-whisper). Pehli dafa model download hoga."""
+    hot = Player.load(player).all_names() if player else None
+    progress, cb = _progress_task(f"Whisper ({model})")
+    with progress:
+        tr = transcribe(video, model_size=model, hotwords=hot, language=language,
+                        beam_size=1 if fast else 5, use_cache=not no_cache, on_progress=cb)
+    console.print(f"[green]{len(tr['words'])} words[/], language={tr['language']} "
+                  f"({tr['language_probability']}), {tr['elapsed']}s on {tr['device']}")
+    preview = " ".join(w[2] for w in tr["words"][:60])
+    console.print(f"[dim]{preview} …[/]")
+
+
+@app.command()
+def find(
+    video: Path,
+    player: Path = typer.Option(..., help="Player folder, e.g. ../samples/players/abdul_qadir"),
+    commentary: bool = typer.Option(True, help="Whisper commentary signal bhi use karo"),
+    model: str = "small",
+    fast: bool = typer.Option(False, help="Commentary tez (beam 1)"),
+    threshold: float = 5.0,
+    cut_clips: bool = typer.Option(False, "--cut", help="Clips bhi bana do"),
+    key: Path = typer.Option(None, help="Answer key — accuracy check ke liye"),
+) -> None:
+    """Video mein player ke moments dhoondo → segments + draft answer key (+ clips)."""
+    from pipeline.finder import FindOptions
+
+    pl = Player.load(player)
+    vi = probe(video)
+    console.print(f"Player: [bold]{pl.name}[/] — names: {', '.join(pl.all_names())}")
+
+    with console.status("Camera cuts…"):
+        shots_ = detect_shots(video)
+    progress, cb = _progress_task("Scoreboard OCR")
+    with progress:
+        scan = scan_graphics(video, on_progress=cb)
+    frames = parse_scan(scan)
+
+    mentions = None
+    if commentary:
+        progress, cb = _progress_task(f"Commentary ({model})")
+        with progress:
+            tr = transcribe(video, model_size=model, hotwords=pl.all_names(),
+                            beam_size=1 if fast else 5, on_progress=cb)
+        mentions = find_mentions(words_from_transcript(tr), pl.all_names())
+        console.print(f"Commentary mentions: {len(mentions)} (language={tr['language']})")
+
+    segs, _ = find_segments(pl, frames, duration=vi.duration, shots=shots_, mentions=mentions,
+                            step=1 / scan["fps"], opts=FindOptions(threshold=threshold))
+
+    t = Table(title=f"{pl.name} — {len(segs)} moments")
+    for col in ("#", "start", "end", "sec", "score", "signals / events"):
+        t.add_column(col)
+    for i, s in enumerate(segs, 1):
+        t.add_row(str(i), format_time(s.start), format_time(s.end), f"{s.duration:.0f}",
+                  f"{s.score:.0f}", ", ".join(s.labels))
+    console.print(t)
+    console.print(f"Kul: {sum(s.duration for s in segs) / 60:.1f} min")
+
+    draft = settings.samples_dir / "answer_keys" / f"{video.stem}__{pl.id}.draft.json"
+    draft.write_text(json.dumps({
+        "video": video.name, "player_id": pl.id, "status": "draft — check karke .draft hata dein",
+        "segments": [{"start": format_time(s.start), "end": format_time(s.end),
+                      "event": ",".join(s.labels)} for s in segs],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"Draft answer key → {draft}")
+
+    if key:
+        truth = [Segment.from_dict(d) for d in json.loads(key.read_text(encoding="utf-8"))["segments"]]
+        r = evaluate(segs, truth)
+        console.print(f"[bold]Accuracy:[/] precision {r.precision:.0%}, recall {r.recall:.0%}, "
+                      f"F1 {r.f1:.0%}, moments pakre {r.hits}/{r.total}")
+
+    if cut_clips and segs:
+        out = settings.storage_dir / "clips" / f"{video.stem[:30]}__{pl.id}"
+        with Progress(console=console) as progress:
+            task = progress.add_task("Cutting", total=len(segs))
+            cut_segments(video, segs, out, prefix=pl.id,
+                         on_progress=lambda i, n: progress.update(task, completed=i))
+        console.print(f"[green]{len(segs)} clips[/] → {out}")
 
 
 if __name__ == "__main__":
