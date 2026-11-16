@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     ffmpeg_bin: str = ""
     ffprobe_bin: str = ""
 
+    # --- API (Phase 5) ---
+    database_url: str = ""  # khali = storage/app.db (SQLite)
+    # API ke saath worker process khud start karo (dev ke liye ek command kaafi)
+    embedded_worker: bool = True
+    cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    max_upload_mb: int = 4096
+    # Local mode: in folders ki video files bina upload ke register ho sakti hain
+    local_video_roots: list[Path] = [PROJECT_ROOT / "samples"]
+
+    @property
+    def players_dir(self) -> Path:
+        return self.storage_dir / "players"
+
     @model_validator(mode="after")
     def _resolve_binaries(self) -> Settings:
         self.ffmpeg_bin = self.ffmpeg_bin or _find_binary("ffmpeg")

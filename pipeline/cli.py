@@ -16,15 +16,14 @@ from rich.table import Table
 
 from app.config import settings
 from pipeline.cutter import cut_segments
-from pipeline.finder import evaluate, find_segments
+from pipeline.finder import evaluate
 from pipeline.frames import Crop, iter_frames
 from pipeline.media import probe
 from pipeline.players import Player
 from pipeline.scenes import detect_shots
 from pipeline.segments import MergeOptions, Segment, format_time, merge_segments, snap_to_shots
-from pipeline.signals.commentary import find_mentions, transcribe, words_from_transcript
-from pipeline.signals.face import face_hits, scan_faces
-from pipeline.signals.scene_text import scan_scene_text
+from pipeline.service import AnalyzeOptions, RenderOptions, analyze, render
+from pipeline.signals.commentary import transcribe
 from pipeline.signals.scoreboard import parse_scan, scan_graphics
 
 app = typer.Typer(help="VideoExtractor pipeline tools", no_args_is_help=True)
@@ -167,55 +166,29 @@ def find(
     player: Path = typer.Option(..., help="Player folder, e.g. ../samples/players/abdul_qadir"),
     commentary: bool = typer.Option(True, help="Whisper commentary signal bhi use karo"),
     face: bool = typer.Option(True, help="Face recognition signal (player images se)"),
-    scene_text: bool = typer.Option(True, help="Jersey ki peeth / frame mein likha naam"),
+    scene_text: bool = typer.Option(False, help="Jersey ki peeth / frame mein likha naam"),
     model: str = "small",
     fast: bool = typer.Option(False, help="Commentary tez (beam 1)"),
     threshold: float = 5.0,
-    cut_clips: bool = typer.Option(False, "--cut", help="Clips bhi bana do"),
+    cut_clips: bool = typer.Option(False, "--cut", help="Raw clips bhi bana do"),
     key: Path = typer.Option(None, help="Answer key — accuracy check ke liye"),
 ) -> None:
-    """Video mein player ke moments dhoondo → segments + draft answer key (+ clips)."""
-    from pipeline.finder import FindOptions
-
+    """Video mein player ke moments dhoondo → table + results + draft answer key."""
     pl = Player.load(player)
-    vi = probe(video)
     console.print(f"Player: [bold]{pl.name}[/] — names: {', '.join(pl.all_names())}")
+    opts = AnalyzeOptions(commentary=commentary, whisper_model=model, fast_commentary=fast,
+                          face=face, scene_text=scene_text, threshold=threshold)
+    with Progress(console=console) as progress:
+        task = progress.add_task("Analyze", total=1.0)
 
-    with console.status("Camera cuts…"):
-        shots_ = detect_shots(video)
-    progress, cb = _progress_task("Scoreboard OCR")
-    with progress:
-        scan = scan_graphics(video, on_progress=cb)
-    frames = parse_scan(scan)
+        def cb(stage: str, frac: float, msg: str) -> None:
+            progress.update(task, completed=frac, description=f"{stage}: {msg}"[:40])
 
-    mentions = None
-    if commentary:
-        progress, cb = _progress_task(f"Commentary ({model})")
-        with progress:
-            tr = transcribe(video, model_size=model, hotwords=pl.all_names(),
-                            beam_size=1 if fast else 5, on_progress=cb)
-        mentions = find_mentions(words_from_transcript(tr), pl.all_names())
-        console.print(f"Commentary mentions: {len(mentions)} (language={tr['language']})")
-
-    hits = counts = None
-    if face:
-        progress, cb = _progress_task("Faces")
-        with progress:
-            fscan = scan_faces(video, pl, on_progress=cb)
-        hits = face_hits(fscan)
-        counts = {fr["t"]: len(fr["faces"]) for fr in fscan["frames"]}
-        console.print(f"Face matches: {len(hits)} frames "
-                      f"(reference: {', '.join(fscan['reference']['used'])})")
-
-    stext = None
-    if scene_text:
-        progress, cb = _progress_task("Jersey / scene text")
-        with progress:
-            stext = scan_scene_text(video, shots_, on_progress=cb)
-
-    segs, _ = find_segments(pl, frames, duration=vi.duration, shots=shots_, mentions=mentions,
-                            faces=hits, face_counts=counts, scene_text=stext,
-                            step=1 / scan["fps"], opts=FindOptions(threshold=threshold))
+        res = analyze(video, pl, opts, cb)
+    stats = res["stats"]
+    console.print(f"Shots {stats['shots']}, commentary mentions {stats['commentary_mentions']}, "
+                  f"face matches {stats['face_matches']}")
+    segs = [Segment(s["start"], s["end"], s["score"], s["labels"]) for s in res["segments"]]
 
     t = Table(title=f"{pl.name} — {len(segs)} moments")
     for col in ("#", "start", "end", "sec", "score", "signals / events"):
@@ -226,7 +199,12 @@ def find(
     console.print(t)
     console.print(f"Kul: {sum(s.duration for s in segs) / 60:.1f} min")
 
+    res_file = _results_path(video, pl.id)
+    res_file.parent.mkdir(parents=True, exist_ok=True)
+    res_file.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+
     draft = settings.samples_dir / "answer_keys" / f"{video.stem}__{pl.id}.draft.json"
+    draft.parent.mkdir(parents=True, exist_ok=True)
     draft.write_text(json.dumps({
         "video": video.name, "player_id": pl.id, "status": "draft — check karke .draft hata dein",
         "segments": [{"start": format_time(s.start), "end": format_time(s.end),
@@ -234,21 +212,9 @@ def find(
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     console.print(f"Draft answer key → {draft}")
 
-    # Results (Phase 4 `make` command inhi se shorts banata hai)
-    def focus_x(s: Segment) -> float | None:
-        xs = [(h.box[0] + h.box[2] / 2) / vi.width for h in hits or []
-              if s.start <= h.t <= s.end]
-        return round(sorted(xs)[len(xs) // 2], 3) if xs else None
-
-    res = _results_path(video, pl.id)
-    res.parent.mkdir(parents=True, exist_ok=True)
-    res.write_text(json.dumps({
-        "video": str(video.resolve()), "player_id": pl.id, "player_name": pl.name,
-        "segments": [{**s.to_dict(), "focus_x": focus_x(s)} for s in segs],
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-
     if key:
-        truth = [Segment.from_dict(d) for d in json.loads(key.read_text(encoding="utf-8"))["segments"]]
+        truth = [Segment.from_dict(d)
+                 for d in json.loads(key.read_text(encoding="utf-8"))["segments"]]
         r = evaluate(segs, truth)
         console.print(f"[bold]Accuracy:[/] precision {r.precision:.0%}, recall {r.recall:.0%}, "
                       f"F1 {r.f1:.0%}, moments pakre {r.hits}/{r.total}")
@@ -274,80 +240,41 @@ def make(
     compilation: bool = typer.Option(True, help="Sab moments ki ek final video"),
     vertical: bool = typer.Option(True, help="Compilation 9:16 (False = 16:9 YouTube)"),
     mode: str = typer.Option("blur", help="blur (poora frame + blurred bg) / crop (player par)"),
-    music: Path = typer.Option(None, help="Background music (default: assets/music ki pehli file)"),
+    music: str = typer.Option(None, help="assets/music mein file ka naam ('' = music nahi)"),
     music_volume: float = 0.35,
     transition: str = typer.Option("fade", help="fade / wipeleft / slideup / circleopen / ..."),
     min_score: float = typer.Option(0, help="Sirf is score se upar wale moments"),
     rerender: bool = typer.Option(False, help="Pehle se bane shorts bhi dobara banao"),
 ) -> None:
     """Phase 4: `find` ke moments se shorts + music wali compilation banao."""
-    from pipeline.compose import (
-        EVENT_TEXT,
-        HORIZONTAL,
-        VERTICAL,
-        compile_video,
-        render_clip,
-        title_card,
-    )
-
     pl = Player.load(player)
     res_file = _results_path(video, pl.id)
     if not res_file.exists():
         console.print(f"[red]Results nahi mile ({res_file.name}). Pehle `find` chalayen.[/]")
         raise typer.Exit(1)
     res = json.loads(res_file.read_text(encoding="utf-8"))
-    res_mtime = res_file.stat().st_mtime
     segs = [s for s in res["segments"] if s["score"] >= min_score]
     if not segs:
         console.print("[yellow]Koi moment nahi.[/]")
         raise typer.Exit(1)
 
-    if music is None:
-        found = sorted(p for p in settings.music_dir.glob("*")
-                       if p.suffix.lower() in {".mp3", ".wav", ".m4a", ".ogg", ".aac", ".mp4", ".webm"})
-        music = found[0] if found else None
-    console.print(f"{pl.name}: {len(segs)} moments, music: {music.name if music else '—'}")
-
     out_dir = settings.storage_dir / "output" / f"{video.stem[:30]}__{pl.id}"
-    size = VERTICAL if vertical else HORIZONTAL
-
-    def event_of(s: dict) -> str | None:
-        return next((lbl for lbl in s["labels"] if lbl in EVENT_TEXT), None)
-
-    rendered: list[Path] = []
+    opts = RenderOptions(shorts=shorts, compilation=compilation, vertical=vertical, mode=mode,
+                         music=music, music_volume=music_volume, transition=transition,
+                         rerender=rerender)
     with Progress(console=console) as progress:
-        if shorts:
-            task = progress.add_task("Shorts (9:16)", total=len(segs))
-            for i, s in enumerate(segs, 1):
-                short = out_dir / "shorts" / f"{pl.id}_{i:02d}.mp4"
-                # Results ke baad bana hua short dobara render nahi (mode badla ho to --rerender)
-                if rerender or not short.exists() or short.stat().st_mtime < res_mtime:
-                    render_clip(video, s["start"], s["end"], short,
-                                size=VERTICAL, mode=mode, focus_x=s.get("focus_x"),
-                                title=pl.name, event=event_of(s))
-                progress.update(task, completed=i)
+        task = progress.add_task("Render", total=1.0)
 
-        if compilation:
-            task = progress.add_task("Compilation clips", total=len(segs))
-            parts = out_dir / "parts"
-            # Shorts aur compilation ka size same ho to dobara render nahi
-            for i, s in enumerate(segs, 1):
-                p = out_dir / "shorts" / f"{pl.id}_{i:02d}.mp4"
-                if not (shorts and vertical):
-                    p = render_clip(video, s["start"], s["end"], parts / f"{i:02d}.mp4",
-                                    size=size, mode=mode, focus_x=s.get("focus_x"),
-                                    title=None, event=event_of(s))
-                rendered.append(p)
-                progress.update(task, completed=i)
-            intro = title_card(parts / "intro.mp4", pl.name, "Best Moments", size=size)
-            final = out_dir / f"{pl.id}_compilation{'' if vertical else '_16x9'}.mp4"
-            with console.status("Final video (transitions + music)…"):
-                compile_video([intro, *rendered], final, music=music,
-                              music_volume=music_volume, transition=transition)
-            console.print(f"[green]Compilation[/] → {final} "
-                          f"({probe(final).duration / 60:.1f} min)")
-    if shorts:
-        console.print(f"[green]{len(segs)} shorts[/] → {out_dir / 'shorts'}")
+        def cb(stage: str, frac: float, msg: str) -> None:
+            progress.update(task, completed=frac, description=f"{stage}: {msg}"[:40])
+
+        r = render(video, pl.name, segs, out_dir, opts, cb)
+    console.print(f"{pl.name}: {len(segs)} moments, music: {r.music or '—'}")
+    if r.shorts:
+        console.print(f"[green]{len(r.shorts)} shorts[/] → {out_dir / 'shorts'}")
+    if r.compilation:
+        console.print(f"[green]Compilation[/] → {r.compilation} "
+                      f"({probe(Path(r.compilation)).duration / 60:.1f} min)")
 
 
 if __name__ == "__main__":
