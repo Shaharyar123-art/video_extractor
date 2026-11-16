@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     storage_dir: Path = PROJECT_ROOT / "storage"
     samples_dir: Path = PROJECT_ROOT / "samples"
     music_dir: Path = PROJECT_ROOT / "assets" / "music"
+    models_dir: Path = PROJECT_ROOT / "models"  # ONNX models (pehli dafa khud download)
 
     # "auto" = GPU ho to GPU, warna CPU
     device: str = "auto"

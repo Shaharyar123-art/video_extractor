@@ -10,10 +10,15 @@ Har second (graphics scan ki fps par) ke liye har source ka score:
 | commentary   | 3     | Commentator ne naam liya (window: -6s … +2s)          |
 | non_striker  | 1     | Crease par hai lekin strike par nahi                  |
 | info         | 1     | Center box mein naam ('LAST WICKET QADIR 45')          |
+| face_strong  | 5     | Chehra bohat mazbooti se match (similarity ≥ 0.6)      |
+| face         | 3     | Chehra match (≥ 0.45) + kit ka rang player ki team ka  |
+| back_name    | 4     | Frame mein (jersey ki peeth par) naam likha            |
+
+Face / back_name poore camera shot par lagte hain (shot ≤ 12s): agar shot mein ek frame mein
+bhi player pehchana gaya to poora shot uska.
 
 Kul score ≥ threshold (default 5) wale seconds → segments → padding/merge → camera cuts tak
 phaila do (taake clip shot ke beech se shuru/khatam na ho).
-Phase 3 mein face / tracking / jersey signals isi table mein add honge.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from pipeline.players import Player, name_score
 from pipeline.scenes import Shot
 from pipeline.segments import MergeOptions, Segment, merge_segments
 from pipeline.signals.commentary import Mention
+from pipeline.signals.face import SIM_STRONG, FaceHit
 from pipeline.signals.scoreboard import FrameGraphics
 
 WEIGHTS = {
@@ -35,6 +41,9 @@ WEIGHTS = {
     "commentary": 3.0,
     "non_striker": 1.0,
     "info": 1.0,
+    "face_strong": 5.0,
+    "face": 3.0,
+    "back_name": 4.0,
 }
 
 NAME_MATCH = 85.0  # name_score threshold (0–100)
@@ -196,6 +205,62 @@ def split_segments(
     return out
 
 
+FACE_VERY_STRONG = 0.6
+MAX_FACES = 4  # is se zyada chehre = team sheet / crowd graphic, ignore
+
+
+def _shot_of(t: float, shots: list[Shot] | None, max_len: float) -> tuple[float, float]:
+    """`t` wala shot (agar chhota ho), warna t ke aas paas ±1s."""
+    for a, b in shots or []:
+        if a <= t < b:
+            return (a, b) if b - a <= max_len else (t - 1.0, t + 1.0)
+    return (t - 1.0, t + 1.0)
+
+
+def _mark_span(tl: Timeline, span: tuple[float, float], source: str) -> None:
+    t = span[0]
+    while t < span[1]:
+        tl.add(t, source)
+        t += tl.step
+
+
+def face_signals(hits: list[FaceHit], tl: Timeline, shots: list[Shot] | None,
+                 max_len: float, face_counts: dict[float, int] | None = None) -> None:
+    for h in hits:
+        if face_counts and face_counts.get(h.t, 0) > MAX_FACES:
+            continue
+        if h.sim >= FACE_VERY_STRONG:
+            source = "face_strong"
+        elif h.sim >= SIM_STRONG:
+            source = "face"
+        else:
+            continue
+        _mark_span(tl, _shot_of(h.t, shots, max_len), source)
+
+
+def scene_text_signals(scan: dict, player: Player, tl: Timeline, shots: list[Shot] | None,
+                       max_len: float) -> None:
+    names = player.all_names()
+    for fr in scan["frames"]:
+        if any(name_score(b[0], names) >= NAME_MATCH for b in fr["boxes"]):
+            _mark_span(tl, _shot_of(fr["t"], shots, max_len), "back_name")
+
+
+def _pad_within_shots(segs: list[Segment], shots: list[Shot], m: MergeOptions) -> list[Segment]:
+    """Jo edge camera cut par nahi (lamba shot), usay padding do — lekin us shot ke andar hi."""
+    bounds = {b for s in shots for b in s}
+    out = []
+    for s in segs:
+        start, end = s.start, s.end
+        for a, b in shots:
+            if a <= start < b and start not in bounds:
+                start = max(a, start - m.pad_before)
+            if a < end <= b and end not in bounds:
+                end = min(b, end + m.pad_after)
+        out.append(Segment(start, end, s.score, list(s.labels)))
+    return out
+
+
 def find_segments(
     player: Player,
     frames: list[FrameGraphics],
@@ -203,6 +268,9 @@ def find_segments(
     duration: float,
     shots: list[Shot] | None = None,
     mentions: list[Mention] | None = None,
+    faces: list[FaceHit] | None = None,
+    face_counts: dict[float, int] | None = None,
+    scene_text: dict | None = None,
     step: float = 1.0,
     opts: FindOptions | None = None,
 ) -> tuple[list[Segment], Timeline]:
@@ -211,16 +279,29 @@ def find_segments(
     graphics_signals(frames, player, tl)
     if mentions:
         commentary_signals(mentions, tl, opts)
+    if faces:
+        face_signals(faces, tl, shots, opts.max_shot_expand, face_counts)
+    if scene_text:
+        scene_text_signals(scene_text, player, tl, shots, opts.max_shot_expand)
 
     raw: list[Segment] = []
     for t in sorted(tl.scores):
         total = tl.total(t)
         if total >= opts.threshold:
-            raw.append(Segment(t - step / 2, t + step / 2, total, sorted(tl.scores[t])))
+            # [t, t+step): sample t se agle sample tak (centered hone se shot ke paar chala jata tha)
+            raw.append(Segment(t, t + step, total, sorted(tl.scores[t])))
 
-    merged = merge_segments(raw, duration, opts.merge)
     if shots:
+        # Camera cuts maloom hain → padding nahi; shot ki had hi clip ki had. (Padding cut ke
+        # paar chali jaati thi aur expand pichhla poora shot khench leta tha.)
+        no_pad = MergeOptions(pad_before=0, pad_after=0, merge_gap=opts.merge.merge_gap,
+                              min_length=0, max_length=1e9)
+        merged = merge_segments(raw, duration, no_pad)
         merged = expand_to_shots(merged, shots, opts.max_shot_expand)
+        merged = _pad_within_shots(merged, shots, opts.merge)
+    else:
+        merged = merge_segments(raw, duration, opts.merge)
+    if shots:
         # phailane ke baad overlap ho sakta hai → dobara jor do (padding ke baghair)
         merged = merge_segments(
             merged, duration,
